@@ -1213,7 +1213,23 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     logger.info("Bill Splitter Bot running (MongoDB: %s/%s)", MONGO_URI, MONGO_DB)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    # Webhook mode for Cloud Run, polling for local dev
+    WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # e.g. https://your-service-xxx.run.app
+    PORT = int(os.environ.get("PORT", "8080"))
+
+    if WEBHOOK_URL:
+        logger.info("Starting in WEBHOOK mode on port %d", PORT)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=f"/webhook/{BOT_TOKEN}",
+            webhook_url=f"{WEBHOOK_URL}/webhook/{BOT_TOKEN}",
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        logger.info("Starting in POLLING mode")
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
