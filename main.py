@@ -81,7 +81,7 @@ def new_bill_doc(chat_id, creator_id, creator_name):
         "jpy_to_thb_rate": None,
         "service_charge_pct": None,  # e.g. 10.0 for 10%
         "vat_pct": None,             # e.g. 7.0 for 7%
-        "fees_inclusive": None,      # True = already in price, False = add on top
+        "fees_mode": None,           # "both_inclusive", "sc_exclusive_vat_inclusive", "both_exclusive", or None
         "items": [],
         "members": {str(creator_id): creator_name},
         "next_item_id": 1,
@@ -142,17 +142,21 @@ def bill_total(bill):
 
 
 def bill_grand_total(bill):
-    """Total including service charge and VAT."""
+    """Total including service charge and VAT based on fees_mode."""
     subtotal = bill_total(bill)
-    inclusive = bill.get("fees_inclusive")
-    if inclusive:
-        # Fees already included in item prices, total is as-is
-        return subtotal
     sc_pct = bill.get("service_charge_pct") or 0
     vat_pct = bill.get("vat_pct") or 0
-    after_sc = subtotal * (1 + sc_pct / 100)
-    grand = after_sc * (1 + vat_pct / 100)
-    return grand
+    mode = bill.get("fees_mode")
+
+    if mode == "both_inclusive":
+        return subtotal
+    elif mode == "sc_exclusive_vat_inclusive":
+        return subtotal * (1 + sc_pct / 100)
+    elif mode == "both_exclusive":
+        after_sc = subtotal * (1 + sc_pct / 100)
+        return after_sc * (1 + vat_pct / 100)
+    else:
+        return subtotal
 
 
 def person_grand_total(bill, user_id):
@@ -171,25 +175,35 @@ def person_fee_breakdown(bill, user_id):
     if subtotal == 0:
         return 0, 0, 0, 0
     p_sub = person_total(bill, user_id)
-    ratio = p_sub / subtotal
     sc_pct = bill.get("service_charge_pct") or 0
     vat_pct = bill.get("vat_pct") or 0
-    inclusive = bill.get("fees_inclusive")
+    mode = bill.get("fees_mode")
 
-    if inclusive:
-        # Back-calculate fees from the inclusive price
-        # price = base + base*sc% + (base + base*sc%)*vat%
-        # price = base * (1 + sc/100) * (1 + vat/100)
+    if mode == "both_inclusive":
+        # Back-calculate: price = base * (1+sc%) * (1+vat%)
         divisor = (1 + sc_pct / 100) * (1 + vat_pct / 100)
         base = p_sub / divisor if divisor else p_sub
         sc_amt = base * sc_pct / 100
         vat_amt = (base + sc_amt) * vat_pct / 100
-        return p_sub, sc_amt, vat_amt, p_sub  # total = same as item price
-    else:
+        return p_sub, sc_amt, vat_amt, p_sub
+
+    elif mode == "sc_exclusive_vat_inclusive":
+        # SC added on top, VAT is inside the total (total = subtotal + SC)
+        total = p_sub * (1 + sc_pct / 100)
+        sc_amt = p_sub * sc_pct / 100
+        # Back-calculate VAT from total: total = before_vat * (1+vat%)
+        before_vat = total / (1 + vat_pct / 100) if vat_pct else total
+        vat_amt = total - before_vat
+        return p_sub, sc_amt, vat_amt, total
+
+    elif mode == "both_exclusive":
         sc_amt = p_sub * sc_pct / 100
         vat_amt = (p_sub + sc_amt) * vat_pct / 100
         total = p_sub + sc_amt + vat_amt
         return p_sub, sc_amt, vat_amt, total
+
+    else:
+        return p_sub, 0, 0, p_sub
 
 
 # --- Helpers ---
@@ -239,7 +253,7 @@ async def parse_receipt_ocr(image_bytes, currency):
         "Respond ONLY with a JSON object, no other text, no markdown.\n\n"
         "Format:\n"
         '{"items": [{"name": "item name", "price": 123.45}, ...], '
-        '"service_charge_pct": null, "vat_pct": null, "fees_inclusive": null}\n\n'
+        '"service_charge_pct": null, "vat_pct": null, "fees_mode": null}\n\n'
         "Rules:\n"
         "- Include individual items only, not subtotals/totals/tax/service charge lines\n"
         "- Use the original item name from the receipt\n"
@@ -248,12 +262,21 @@ async def parse_receipt_ocr(image_bytes, currency):
         "put the percentage as a number (e.g. 10 for 10%). Otherwise null.\n"
         "- For vat_pct: if the receipt shows VAT/tax, "
         "put the percentage as a number (e.g. 7 for 7%). Otherwise null.\n"
-        "- For fees_inclusive: determine if the item prices ALREADY INCLUDE "
-        "tax/service charge. Set true if the total equals the sum of item prices "
-        "(meaning fees are included in the prices). Set false if fees are added "
-        "on top of the item subtotal. Set null if you cannot determine.\n"
+        "- For fees_mode: determine how fees are applied. Must be one of:\n"
+        '  "both_inclusive" — item prices already include SC and VAT. '
+        "The TOTAL equals the sum of items.\n"
+        '  "sc_exclusive_vat_inclusive" — SC is added on top of item subtotal, '
+        "but VAT is already included in the final total (not added again). "
+        "TOTAL = subtotal + SC. VAT line is just a breakdown.\n"
+        '  "both_exclusive" — both SC and VAT are added on top. '
+        "TOTAL = subtotal + SC + VAT.\n"
+        "  null — if you cannot determine.\n"
+        "- To detect: compare the sum of item prices to the TOTAL on the receipt. "
+        "If TOTAL = sum of items → both_inclusive. "
+        "If TOTAL = sum + SC (and VAT is shown as breakdown of total) → sc_exclusive_vat_inclusive. "
+        "If TOTAL = sum + SC + VAT → both_exclusive.\n"
         "- If you can't read the receipt clearly, return: "
-        '{"items": [], "service_charge_pct": null, "vat_pct": null, "fees_inclusive": null}\n'
+        '{"items": [], "service_charge_pct": null, "vat_pct": null, "fees_mode": null}\n'
     )
 
     try:
@@ -300,11 +323,11 @@ async def parse_receipt_ocr(image_bytes, currency):
         # Handle both formats: new dict format and legacy array format
         sc_pct = None
         vat_pct = None
-        fees_inclusive = None
+        fees_mode = None
         if isinstance(items_data, dict):
             sc_pct = items_data.get("service_charge_pct")
             vat_pct = items_data.get("vat_pct")
-            fees_inclusive = items_data.get("fees_inclusive")
+            fees_mode = items_data.get("fees_mode")
             items_list = items_data.get("items", [])
         else:
             items_list = items_data
@@ -316,8 +339,8 @@ async def parse_receipt_ocr(image_bytes, currency):
             if name and price > 0:
                 items.append((name, price))
 
-        logger.info(f"Gemini extracted {len(items)} items, sc={sc_pct}%, vat={vat_pct}%, inclusive={fees_inclusive}")
-        return items, sc_pct, vat_pct, fees_inclusive
+        logger.info(f"Gemini extracted {len(items)} items, sc={sc_pct}%, vat={vat_pct}%, mode={fees_mode}")
+        return items, sc_pct, vat_pct, fees_mode
 
     except Exception as e:
         logger.error(f"Gemini API error: {e}")
@@ -353,15 +376,41 @@ def input_method_keyboard():
     ])
 
 
-def fees_confirm_keyboard(sc, vat, inclusive):
+FEES_MODE_LABELS = {
+    "both_inclusive": "All inclusive (total = items)",
+    "sc_exclusive_vat_inclusive": "SC on top, VAT included",
+    "both_exclusive": "SC + VAT both on top",
+}
+
+
+def fees_confirm_keyboard(sc, vat, mode):
     """Inline buttons to confirm or edit detected fees."""
-    inc_label = "tax-inclusive" if inclusive else "tax-exclusive"
-    label = f"✅ SC {sc:.0f}% + VAT {vat:.0f}% ({inc_label})"
-    inc_val = "true" if inclusive else "false"
+    mode_label = FEES_MODE_LABELS.get(mode, mode)
+    label = f"✅ SC {sc:.0f}% + VAT {vat:.0f}% — {mode_label}"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(label, callback_data=f"fees:confirm:{sc}:{vat}:{inc_val}")],
+        [InlineKeyboardButton(label, callback_data=f"fees:confirm:{sc}:{vat}:{mode}")],
+        [InlineKeyboardButton("🔄 Change fee mode", callback_data=f"fees:pickmode:{sc}:{vat}")],
         [InlineKeyboardButton("✏️ Edit fees manually", callback_data="fees:edit")],
         [InlineKeyboardButton("❌ No fees on this bill", callback_data="fees:none")],
+    ])
+
+
+def fees_mode_keyboard(sc, vat):
+    """Inline buttons to pick fee mode."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "1️⃣ All inclusive (total = items)",
+            callback_data=f"fees:confirm:{sc}:{vat}:both_inclusive",
+        )],
+        [InlineKeyboardButton(
+            "2️⃣ SC on top, VAT included",
+            callback_data=f"fees:confirm:{sc}:{vat}:sc_exclusive_vat_inclusive",
+        )],
+        [InlineKeyboardButton(
+            "3️⃣ SC + VAT both on top",
+            callback_data=f"fees:confirm:{sc}:{vat}:both_exclusive",
+        )],
+        [InlineKeyboardButton("❌ No fees", callback_data="fees:none")],
     ])
 
 
@@ -401,6 +450,7 @@ def format_summary(bill):
     rate = bill.get("jpy_to_thb_rate")
     sc_pct = bill.get("service_charge_pct") or 0
     vat_pct = bill.get("vat_pct") or 0
+    mode = bill.get("fees_mode")
     lines = []
 
     lines.append("💸 *BILL SPLIT SUMMARY*")
@@ -412,29 +462,42 @@ def format_summary(bill):
     else:
         lines.append(f"📅 {created}")
 
-    inclusive = bill.get("fees_inclusive")
     lines.append(f"💴 Currency: *{bill['currency']}*")
 
-    if sc_pct or vat_pct:
-        inc_label = "tax-inclusive" if inclusive else "tax-exclusive"
-        if inclusive:
+    if mode and (sc_pct or vat_pct):
+        mode_label = FEES_MODE_LABELS.get(mode, "")
+
+        if mode == "both_inclusive":
             divisor = (1 + sc_pct / 100) * (1 + vat_pct / 100)
             base = subtotal / divisor if divisor else subtotal
             sc_amount = base * sc_pct / 100
             vat_amount = (base + sc_amount) * vat_pct / 100
-            lines.append(f"💰 *Total: {symbol}{subtotal:,.0f}* ({inc_label})")
+            lines.append(f"💰 *Total: {symbol}{subtotal:,.0f}* ({mode_label})")
             if sc_pct:
                 lines.append(f"    ↳ SC {sc_pct:.0f}%: {symbol}{sc_amount:,.0f}")
             if vat_pct:
                 lines.append(f"    ↳ VAT {vat_pct:.0f}%: {symbol}{vat_amount:,.0f}")
-        else:
+
+        elif mode == "sc_exclusive_vat_inclusive":
+            sc_amount = subtotal * sc_pct / 100
+            total_after_sc = subtotal + sc_amount
+            before_vat = total_after_sc / (1 + vat_pct / 100) if vat_pct else total_after_sc
+            vat_amount = total_after_sc - before_vat
+            lines.append(f"💰 Subtotal: {symbol}{subtotal:,.0f}")
+            if sc_pct:
+                lines.append(f"🧾 + SC {sc_pct:.0f}%: {symbol}{sc_amount:,.0f}")
+            lines.append(f"💰 *Total: {symbol}{grand:,.0f}* ({mode_label})")
+            if vat_pct:
+                lines.append(f"    ↳ VAT {vat_pct:.0f}%: {symbol}{vat_amount:,.0f}")
+
+        elif mode == "both_exclusive":
             sc_amount = subtotal * sc_pct / 100
             vat_amount = (subtotal + sc_amount) * vat_pct / 100
             lines.append(f"💰 Subtotal: {symbol}{subtotal:,.0f}")
             if sc_pct:
-                lines.append(f"🧾 SC {sc_pct:.0f}%: {symbol}{sc_amount:,.0f}")
+                lines.append(f"🧾 + SC {sc_pct:.0f}%: {symbol}{sc_amount:,.0f}")
             if vat_pct:
-                lines.append(f"🧾 VAT {vat_pct:.0f}%: {symbol}{vat_amount:,.0f}")
+                lines.append(f"🧾 + VAT {vat_pct:.0f}%: {symbol}{vat_amount:,.0f}")
             lines.append(f"💰 *Grand Total: {symbol}{grand:,.0f}*")
     else:
         lines.append(f"💰 *Total: {symbol}{subtotal:,.0f}*")
@@ -464,15 +527,22 @@ def format_summary(bill):
 
         if person_items:
             lines.append("\n".join(person_items))
-            if sc_pct or vat_pct:
-                if inclusive:
+            if mode and (sc_pct or vat_pct):
+                if mode == "both_inclusive":
                     lines.append(f"    Items: {symbol}{p_sub:,.0f}")
                     if sc_pct:
                         lines.append(f"    _(includes SC: {symbol}{p_sc:,.0f})_")
                     if vat_pct:
                         lines.append(f"    _(includes VAT: {symbol}{p_vat:,.0f})_")
                     lines.append(f"    → *Pay: {symbol}{p_total:,.0f}*")
-                else:
+                elif mode == "sc_exclusive_vat_inclusive":
+                    lines.append(f"    Items: {symbol}{p_sub:,.0f}")
+                    if sc_pct:
+                        lines.append(f"    + SC {sc_pct:.0f}%: {symbol}{p_sc:,.0f}")
+                    if vat_pct:
+                        lines.append(f"    _(includes VAT: {symbol}{p_vat:,.0f})_")
+                    lines.append(f"    → *Pay: {symbol}{p_total:,.0f}*")
+                elif mode == "both_exclusive":
                     lines.append(f"    Items: {symbol}{p_sub:,.0f}")
                     if sc_pct:
                         lines.append(f"    + SC {sc_pct:.0f}%: {symbol}{p_sc:,.0f}")
@@ -523,8 +593,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/done — Finalize and show summary\n"
         "/cancel — Cancel current bill\n"
         "/history — View past bills\n"
-        "/setfees `sc vat inclusive/exclusive` — Set fees\n"
-        "  _Example:_ `/setfees 10 7 inclusive`\n\n"
+        "/setfees `sc vat mode` — Set fees\n"
+        "  _Modes:_ `both_inc` / `sc_exc` / `both_exc`\n"
+        "  _Example:_ `/setfees 10 7 both_exc`\n\n"
         "*Currencies:* THB 🇹🇭 and JPY 🇯🇵\n"
         "AI reads fees from receipt and asks for confirmation.\n"
         "Use /setfees to adjust anytime."
@@ -783,12 +854,15 @@ async def cmd_setfees(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         sc = bill.get("service_charge_pct") or 0
         vat = bill.get("vat_pct") or 0
-        inc = bill.get("fees_inclusive")
-        inc_label = "inclusive" if inc else ("exclusive" if inc is False else "not set")
+        mode = bill.get("fees_mode")
+        mode_label = FEES_MODE_LABELS.get(mode, "not set")
         await update.message.reply_text(
-            f"Current fees: SC {sc:.0f}% | VAT {vat:.0f}% ({inc_label})\n\n"
-            "Usage: `/setfees 10 7 inclusive`\n"
-            "Or: `/setfees 10 7 exclusive`\n"
+            f"Current fees: SC {sc:.0f}% | VAT {vat:.0f}% ({mode_label})\n\n"
+            "Usage: `/setfees 10 7 MODE`\n"
+            "Modes:\n"
+            "  `both_inc` — All inclusive (total = items)\n"
+            "  `sc_exc` — SC on top, VAT included\n"
+            "  `both_exc` — SC + VAT both on top\n"
             "To clear: `/setfees 0 0`",
             parse_mode="Markdown",
         )
@@ -802,42 +876,52 @@ async def cmd_setfees(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise ValueError
     except (ValueError, IndexError):
         await update.message.reply_text(
-            "Usage: `/setfees 10 7 inclusive` or `/setfees 10 7 exclusive`",
+            "Usage: `/setfees 10 7 both_exc`\n"
+            "Modes: `both_inc` / `sc_exc` / `both_exc`",
             parse_mode="Markdown",
         )
         return
 
-    # Parse inclusive/exclusive flag
-    inclusive = None
+    # Parse mode flag
+    fees_mode = None
     if len(parts) > 2:
         flag = parts[2].lower()
-        if flag in ("inclusive", "inc", "in"):
-            inclusive = True
-        elif flag in ("exclusive", "exc", "ex"):
-            inclusive = False
+        mode_map = {
+            "both_inc": "both_inclusive",
+            "both_inclusive": "both_inclusive",
+            "inclusive": "both_inclusive",
+            "inc": "both_inclusive",
+            "sc_exc": "sc_exclusive_vat_inclusive",
+            "sc_exclusive_vat_inclusive": "sc_exclusive_vat_inclusive",
+            "sc_exclusive": "sc_exclusive_vat_inclusive",
+            "both_exc": "both_exclusive",
+            "both_exclusive": "both_exclusive",
+            "exclusive": "both_exclusive",
+            "exc": "both_exclusive",
+        }
+        fees_mode = mode_map.get(flag)
 
-    if inclusive is None and (sc > 0 or vat > 0):
-        # Ask user to specify
+    if fees_mode is None and (sc > 0 or vat > 0):
+        # Show mode picker buttons
         await update.message.reply_text(
-            f"SC {sc:.0f}% + VAT {vat:.0f}% — is this tax-inclusive or exclusive?\n\n"
-            f"`/setfees {sc:.0f} {vat:.0f} inclusive` — already in item prices\n"
-            f"`/setfees {sc:.0f} {vat:.0f} exclusive` — added on top",
+            f"SC {sc:.0f}% + VAT {vat:.0f}% — how are fees applied?",
             parse_mode="Markdown",
+            reply_markup=fees_mode_keyboard(sc, vat),
         )
         return
 
     bill["service_charge_pct"] = sc
     bill["vat_pct"] = vat
-    bill["fees_inclusive"] = inclusive if (sc > 0 or vat > 0) else None
+    bill["fees_mode"] = fees_mode if (sc > 0 or vat > 0) else None
     bill["awaiting_fees"] = False
     save_bill(bill)
 
     symbol = "¥" if bill["currency"] == "JPY" else "฿"
     subtotal = bill_total(bill)
-    inc_label = "tax-inclusive" if inclusive else ("tax-exclusive" if inclusive is False else "")
+    mode_label = FEES_MODE_LABELS.get(fees_mode, "")
     text = f"✅ Fees set: SC {sc:.0f}% | VAT {vat:.0f}%"
-    if inc_label:
-        text += f" ({inc_label})"
+    if mode_label:
+        text += f" ({mode_label})"
     if subtotal > 0:
         text += f"\n💰 Total: {symbol}{bill_grand_total(bill):,.0f}"
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -995,20 +1079,30 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split(":")
         sc = float(parts[2])
         vat = float(parts[3])
-        inclusive = parts[4] == "true"
+        mode = parts[4]  # "both_inclusive", "sc_exclusive_vat_inclusive", "both_exclusive"
         bill["service_charge_pct"] = sc
         bill["vat_pct"] = vat
-        bill["fees_inclusive"] = inclusive
+        bill["fees_mode"] = mode
         bill["awaiting_fees"] = False
         save_bill(bill)
         symbol = "¥" if bill["currency"] == "JPY" else "฿"
-        inc_label = "tax-inclusive" if inclusive else "tax-exclusive"
+        mode_label = FEES_MODE_LABELS.get(mode, mode)
         grand = bill_grand_total(bill)
         await query.edit_message_text(
-            f"✅ Fees confirmed: SC {sc:.0f}% + VAT {vat:.0f}% ({inc_label})\n"
+            f"✅ Fees confirmed: SC {sc:.0f}% + VAT {vat:.0f}% ({mode_label})\n"
             f"💰 Total: {symbol}{grand:,.0f}\n\n"
             "Members: /join then /items to pick your items!",
             parse_mode="Markdown",
+        )
+
+    elif data.startswith("fees:pickmode:"):
+        parts = data.split(":")
+        sc = float(parts[2])
+        vat = float(parts[3])
+        await query.edit_message_text(
+            f"SC {sc:.0f}% + VAT {vat:.0f}% — how are fees applied?",
+            parse_mode="Markdown",
+            reply_markup=fees_mode_keyboard(sc, vat),
         )
 
     elif data == "fees:edit":
@@ -1016,8 +1110,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_bill(bill)
         await query.edit_message_text(
             "✏️ Enter fees using the command:\n"
-            "`/setfees 10 7` (service% vat%)\n\n"
-            "Example: `/setfees 10 7` for 10% service + 7% VAT\n"
+            "`/setfees 10 7 MODE`\n\n"
+            "Modes: `both_inc` / `sc_exc` / `both_exc`\n"
+            "Example: `/setfees 10 7 both_exc`\n"
             "Or `/setfees 0 0` for no fees.",
             parse_mode="Markdown",
         )
@@ -1025,6 +1120,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "fees:none":
         bill["service_charge_pct"] = 0
         bill["vat_pct"] = 0
+        bill["fees_mode"] = None
         bill["awaiting_fees"] = False
         save_bill(bill)
         symbol = "¥" if bill["currency"] == "JPY" else "฿"
@@ -1090,7 +1186,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo_bytes = await file.download_as_bytearray()
 
     msg = await update.message.reply_text("🔍 Reading receipt with Gemini AI...")
-    items, sc_pct, vat_pct, fees_inclusive = await parse_receipt_ocr(bytes(photo_bytes), bill["currency"])
+    items, sc_pct, vat_pct, fees_mode = await parse_receipt_ocr(bytes(photo_bytes), bill["currency"])
 
     if not items:
         await msg.edit_text(
@@ -1117,19 +1213,24 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + f"\n\n💰 Subtotal: {symbol}{total:,.0f}"
     )
 
+    # Validate fees_mode
+    valid_modes = ("both_inclusive", "sc_exclusive_vat_inclusive", "both_exclusive")
+    if fees_mode not in valid_modes:
+        fees_mode = None
+
     # Ask for fee confirmation
     if detected_sc is not None or detected_vat is not None:
         sc_val = detected_sc or 0
         vat_val = detected_vat or 0
-        inc = fees_inclusive if fees_inclusive is not None else True
-        inc_label = "tax-inclusive ✅" if inc else "tax-exclusive (added on top)"
-        text += f"\n\n🧾 Detected: SC {sc_val:.0f}% | VAT {vat_val:.0f}% — {inc_label}"
+        mode = fees_mode or "both_inclusive"  # default guess
+        mode_label = FEES_MODE_LABELS.get(mode, "")
+        text += f"\n\n🧾 Detected: SC {sc_val:.0f}% | VAT {vat_val:.0f}% — {mode_label}"
         text += "\nPlease confirm or edit:"
         save_bill(bill)
         await msg.edit_text(
             text,
             parse_mode="Markdown",
-            reply_markup=fees_confirm_keyboard(sc_val, vat_val, inc),
+            reply_markup=fees_confirm_keyboard(sc_val, vat_val, mode),
         )
     else:
         # Nothing detected — suggest common rates based on currency
@@ -1140,7 +1241,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(
                 text,
                 parse_mode="Markdown",
-                reply_markup=fees_confirm_keyboard(10, 7, True),
+                reply_markup=fees_confirm_keyboard(10, 7, "both_inclusive"),
             )
         else:
             text += "\n\n🧾 No fees detected on receipt."
