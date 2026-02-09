@@ -258,6 +258,12 @@ async def parse_receipt_ocr(image_bytes, currency):
         "- Include individual items only, not subtotals/totals/tax/service charge lines\n"
         "- Use the original item name from the receipt\n"
         "- Price should be a number without currency symbols\n"
+        "- DISCOUNTS: If an item has a discount (e.g. '10% off', promo, member price), "
+        "use the NET price after discount. For example if item is 100 with -10 discount, "
+        "the price should be 90. If some items are discounted and others are not, "
+        "use net price for discounted items and original price for non-discounted items.\n"
+        "- Do NOT include discount lines as separate items.\n"
+        "- The sum of all item prices should equal the receipt's subtotal AFTER discount.\n"
         "- For service_charge_pct: if the receipt shows a service charge, "
         "put the percentage as a number (e.g. 10 for 10%). Otherwise null.\n"
         "- For vat_pct: if the receipt shows VAT/tax, "
@@ -271,10 +277,11 @@ async def parse_receipt_ocr(image_bytes, currency):
         '  "both_exclusive" — both SC and VAT are added on top. '
         "TOTAL = subtotal + SC + VAT.\n"
         "  null — if you cannot determine.\n"
-        "- To detect: compare the sum of item prices to the TOTAL on the receipt. "
-        "If TOTAL = sum of items → both_inclusive. "
-        "If TOTAL = sum + SC (and VAT is shown as breakdown of total) → sc_exclusive_vat_inclusive. "
-        "If TOTAL = sum + SC + VAT → both_exclusive.\n"
+        "- To detect fees_mode: use the AFTER-DISCOUNT subtotal as the base. "
+        "Compare it to the TOTAL on the receipt. "
+        "If TOTAL = subtotal → both_inclusive. "
+        "If TOTAL = subtotal + SC (and VAT is shown as breakdown) → sc_exclusive_vat_inclusive. "
+        "If TOTAL = subtotal + SC + VAT → both_exclusive.\n"
         "- If you can't read the receipt clearly, return: "
         '{"items": [], "service_charge_pct": null, "vat_pct": null, "fees_mode": null}\n'
     )
@@ -298,7 +305,9 @@ async def parse_receipt_ocr(image_bytes, currency):
             ],
             "generationConfig": {
                 "temperature": 0.1,
-                "maxOutputTokens": 2000,
+                "maxOutputTokens": 8192,
+                "responseMimeType": "application/json",
+                "thinkingConfig": {"thinkingBudget": 0},
             },
         }
 
@@ -314,11 +323,66 @@ async def parse_receipt_ocr(image_bytes, currency):
         data = resp.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-        # Clean up — extract JSON array
-        if "```" in text:
-            text = re.search(r'```(?:json)?\s*(.*?)```', text, re.DOTALL).group(1).strip()
+        # Check if response was truncated
+        finish_reason = data["candidates"][0].get("finishReason", "")
+        if finish_reason == "MAX_TOKENS":
+            logger.warning("Gemini response truncated (MAX_TOKENS). Attempting partial parse.")
 
-        items_data = json.loads(text)
+        # Clean up — extract JSON from markdown code blocks
+        if "```" in text:
+            m = re.search(r'```(?:json)?\s*(.*?)```', text, re.DOTALL)
+            if m:
+                text = m.group(1).strip()
+
+        # Remove any leading/trailing non-JSON text
+        start = text.find('{')
+        if start == -1:
+            start = text.find('[')
+        if start != -1:
+            # Find matching closing bracket
+            bracket = text[start]
+            close = '}' if bracket == '{' else ']'
+            depth = 0
+            end = len(text)  # default to full text if no match
+            for i in range(start, len(text)):
+                if text[i] == bracket:
+                    depth += 1
+                elif text[i] == close:
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            text = text[start:end]
+
+        # Fix common JSON issues from Gemini
+        text = re.sub(r',\s*([}\]])', r'\1', text)  # trailing commas
+        text = re.sub(r':\s*,', ': null,', text)     # empty values
+        text = text.replace('\n', ' ')                 # newlines in strings
+
+        # If JSON is truncated (no closing bracket), try to fix it
+        if text and text[-1] not in ('}', ']'):
+            # Remove trailing incomplete item
+            last_complete = max(text.rfind('},'), text.rfind('}]'))
+            if last_complete > 0:
+                text = text[:last_complete + 1]
+                # Close open structures
+                open_braces = text.count('{') - text.count('}')
+                open_brackets = text.count('[') - text.count(']')
+                text += ']' * open_brackets + '}' * open_braces
+                logger.info(f"Repaired truncated JSON: ...{text[-80:]}")
+
+        try:
+            items_data = json.loads(text)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parse failed: {e}\nRaw text: {text[:500]}")
+            # Last resort: try to extract items with regex
+            items = []
+            for m in re.finditer(r'"name"\s*:\s*"([^"]+)"\s*,\s*"price"\s*:\s*([\d.]+)', text):
+                items.append((m.group(1), float(m.group(2))))
+            if items:
+                logger.info(f"Regex fallback extracted {len(items)} items")
+                return items, None, None, None
+            return [], None, None, None
 
         # Handle both formats: new dict format and legacy array format
         sc_pct = None
@@ -1316,8 +1380,8 @@ def main():
     logger.info("Bill Splitter Bot running (MongoDB: %s/%s)", MONGO_URI, MONGO_DB)
 
     # Webhook mode for Cloud Run, polling for local dev
-    WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # e.g. https://your-service-xxx.run.app
-    PORT = int(os.environ.get("PORT", "8080"))
+    WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+    PORT = int(os.environ.get("PORT", "8080")) 
 
     if WEBHOOK_URL:
         logger.info("Starting in WEBHOOK mode on port %d", PORT)
