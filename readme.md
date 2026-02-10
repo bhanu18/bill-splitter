@@ -85,7 +85,7 @@ The bot handles both billing styles:
 ```bash
 cd bill-splitter-bot
 python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+source venv/Scripts/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
@@ -125,7 +125,7 @@ help - Show help
 ### 4. Run
 
 ```bash
-python bill_splitter_bot.py
+python main.py
 ```
 
 ## Deployment
@@ -145,11 +145,9 @@ docker-compose up -d
 ## Project Structure
 
 ```
-├── bill_splitter_bot.py   # Main bot application
+├── main.py   # Main bot application
 ├── requirements.txt       # Python dependencies
 ├── Dockerfile             # Container build file
-├── docker-compose.yml     # Docker Compose with MongoDB
-├── DEPLOY.md              # Deployment guide for Oracle Cloud
 ├── README.md              # This file
 └── .env                   # Environment variables (not committed)
 ```
