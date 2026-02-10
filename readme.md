@@ -83,7 +83,6 @@ The bot handles both billing styles:
 ### 1. Clone and install
 
 ```bash
-git clone <your-repo-url>
 cd bill-splitter-bot
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
@@ -143,19 +142,6 @@ docker run -d --name bill-bot --env-file .env --restart unless-stopped bill-spli
 ```bash
 docker-compose up -d
 ```
-
-### VPS Hosting Options
-
-| Provider | Cost | Notes |
-|---|---|---|
-| Oracle Cloud | Free | 4 ARM CPU, 24GB RAM. Best free tier |
-| Hetzner | €3.29/mo | Reliable, EU/US datacenters |
-| Vultr | $3.50/mo | Tokyo datacenter available |
-| DigitalOcean | $4/mo | Singapore datacenter available |
-| Railway | ~$5/mo | Deploy from Git, no server management |
-
-For deployment instructions, see [DEPLOY.md](DEPLOY.md).
-
 ## Project Structure
 
 ```
