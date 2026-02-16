@@ -84,12 +84,15 @@ def new_bill_doc(chat_id, creator_id, creator_name):
         "fees_mode": None,           # "both_inclusive", "sc_exclusive_vat_inclusive", "both_exclusive", or None
         "items": [],
         "members": {str(creator_id): creator_name},
+        "non_members": {},           # {"nm_1": "John", "nm_2": "Jane"}
+        "next_nm_id": 1,
         "next_item_id": 1,
         "created_at": datetime.now(timezone.utc),
         "is_finalized": False,
         "awaiting_photo": False,
         "awaiting_manual_rate": False,
         "awaiting_fees": False,
+        "awaiting_nm_name": None,    # item_id waiting for non-member name input
     }
 
 
@@ -490,6 +493,34 @@ def items_keyboard(bill):
     return InlineKeyboardMarkup(buttons)
 
 
+def assign_keyboard(bill, item_id):
+    """Inline buttons to assign an item: members + non-members + add new."""
+    buttons = []
+    # Existing members
+    for uid_str, name in bill["members"].items():
+        buttons.append([InlineKeyboardButton(
+            f"👤 {name}", callback_data=f"assign:{item_id}:m:{uid_str}"
+        )])
+    # Existing non-members
+    for nm_id, name in bill.get("non_members", {}).items():
+        buttons.append([InlineKeyboardButton(
+            f"👥 {name} (guest)", callback_data=f"assign:{item_id}:nm:{nm_id}"
+        )])
+    # Add new non-member
+    buttons.append([InlineKeyboardButton(
+        "➕ Add non-member (type name)", callback_data=f"assign:{item_id}:new"
+    )])
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="assign:cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def all_people(bill):
+    """Return combined dict of members + non_members: {id_str: name}."""
+    people = dict(bill["members"])
+    people.update(bill.get("non_members", {}))
+    return people
+
+
 # --- Formatting ---
 
 def format_items_list(bill):
@@ -571,11 +602,16 @@ def format_summary(bill):
         lines.append(f"🔄 Rate: ¥1 = ฿{rate:.4f}")
         lines.append(f"💰 Total (THB): *฿{thb_grand:,.2f}*")
 
-    lines.append(f"👥 Members: {len(bill['members'])}")
+    people = all_people(bill)
+    nm_count = len(bill.get("non_members", {}))
+    member_label = f"👥 Members: {len(bill['members'])}"
+    if nm_count:
+        member_label += f" + {nm_count} guest{'s' if nm_count > 1 else ''}"
+    lines.append(member_label)
     lines.append("━━━━━━━━━━━━━━━━━━━━\n")
 
-    for uid_str, name in bill["members"].items():
-        uid = int(uid_str)
+    for uid_str, name in people.items():
+        is_guest = uid_str.startswith("nm_")
         person_items = []
         for item in bill["items"]:
             for claim in item["claimed_by"]:
@@ -586,8 +622,9 @@ def format_summary(bill):
                     person_items.append(f"    • {item['name']}: {symbol}{share:,.0f}{suffix}")
                     break
 
-        p_sub, p_sc, p_vat, p_total = person_fee_breakdown(bill, uid)
-        lines.append(f"👤 *{name}*")
+        p_sub, p_sc, p_vat, p_total = person_fee_breakdown(bill, uid_str)
+        guest_tag = " _(guest)_" if is_guest else ""
+        lines.append(f"👤 *{name}*{guest_tag}")
 
         if person_items:
             lines.append("\n".join(person_items))
@@ -652,7 +689,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/pick `number` — Pick an item for yourself\n"
         "/unpick `number` — Remove yourself from item\n"
         "/resetpicks — Clear all your picks\n"
-        "/assign `number @user` — Assign item to someone\n\n"
+        "/assign `number` — Pick person from list\n"
+        "/assign `number Name` — Assign to non-member\n"
+        "/assign `number @user` — Assign to member\n"
+        "/unassign `number Name` — Remove assignment\n\n"
         "*Finish:*\n"
         "/done — Finalize and show summary\n"
         "/cancel — Cancel current bill\n"
@@ -843,39 +883,149 @@ async def cmd_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Only the bill creator can assign items.")
         return
 
-    match = re.search(r'/assign(?:@\w+)?\s+(\d+)\s+@(\w+)', update.message.text.strip())
-    if not match:
-        await update.message.reply_text("Usage: `/assign 1 @username`", parse_mode="Markdown")
+    text = re.sub(r'^/assign(@\w+)?\s*', '', update.message.text.strip())
+    if not text:
+        await update.message.reply_text(
+            "Usage:\n"
+            "`/assign 1` — pick from list\n"
+            "`/assign 1 @user` — assign to member\n"
+            "`/assign 1 John` — assign to non-member",
+            parse_mode="Markdown",
+        )
         return
 
-    item = get_item(bill, int(match.group(1)))
+    parts = text.split(None, 1)
+    try:
+        item_id = int(parts[0])
+    except ValueError:
+        await update.message.reply_text("Usage: `/assign 1` or `/assign 1 Name`", parse_mode="Markdown")
+        return
+
+    item = get_item(bill, item_id)
     if not item:
-        await update.message.reply_text(f"Item #{match.group(1)} not found.")
+        await update.message.reply_text(f"Item #{item_id} not found.")
         return
 
-    target_username = match.group(2)
-    target_uid = None
-    target_name = None
-    for uid_str, name in bill["members"].items():
-        if name.lower() == f"@{target_username}".lower():
-            target_uid = uid_str
-            target_name = name
-            break
-
-    if not target_uid:
-        await update.message.reply_text(f"@{target_username} hasn't joined yet. They need to /join first.")
+    # Just item number — show picker
+    if len(parts) == 1:
+        symbol = "¥" if bill["currency"] == "JPY" else "฿"
+        await update.message.reply_text(
+            f"Assign `#{item['id']}` {item['name']} ({symbol}{item['price']:,.0f}) to:",
+            parse_mode="Markdown",
+            reply_markup=assign_keyboard(bill, item_id),
+        )
         return
 
-    if any(str(c["user_id"]) == target_uid for c in item["claimed_by"]):
-        await update.message.reply_text(f"{target_name} already has item #{item['id']}.")
+    # Has a name/username argument
+    target = parts[1].strip()
+
+    if target.startswith("@"):
+        # Assign to member by @username
+        target_username = target[1:]
+        target_uid = None
+        target_name = None
+        for uid_str, name in bill["members"].items():
+            if name.lower() == f"@{target_username}".lower():
+                target_uid = uid_str
+                target_name = name
+                break
+        if not target_uid:
+            await update.message.reply_text(f"@{target_username} hasn't joined. They need to /join first.")
+            return
+        if any(str(c["user_id"]) == target_uid for c in item["claimed_by"]):
+            await update.message.reply_text(f"{target_name} already has item #{item['id']}.")
+            return
+        item["claimed_by"].append({"user_id": target_uid, "name": target_name})
+        save_bill(bill)
+        await update.message.reply_text(
+            f"✅ Assigned `#{item['id']}` {item['name']} → *{target_name}*",
+            parse_mode="Markdown",
+        )
+    else:
+        # Assign to non-member by name
+        nm_name = target
+        # Find existing non-member with this name
+        nm_id = None
+        for nid, nname in bill.get("non_members", {}).items():
+            if nname.lower() == nm_name.lower():
+                nm_id = nid
+                nm_name = nname  # preserve original casing
+                break
+        # Create new non-member if not found
+        if nm_id is None:
+            nm_id = f"nm_{bill.get('next_nm_id', 1)}"
+            bill["next_nm_id"] = bill.get("next_nm_id", 1) + 1
+            if "non_members" not in bill:
+                bill["non_members"] = {}
+            bill["non_members"][nm_id] = nm_name
+
+        if any(str(c["user_id"]) == nm_id for c in item["claimed_by"]):
+            await update.message.reply_text(f"{nm_name} already has item #{item['id']}.")
+            return
+        item["claimed_by"].append({"user_id": nm_id, "name": nm_name})
+        save_bill(bill)
+        await update.message.reply_text(
+            f"✅ Assigned `#{item['id']}` {item['name']} → *{nm_name}* (guest)",
+            parse_mode="Markdown",
+        )
+
+
+async def cmd_unassign(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Creator removes someone's assignment from an item."""
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    bill = get_active_bill(chat_id)
+
+    if not bill:
+        await update.message.reply_text("No active bill.")
+        return
+    if user.id != bill["creator_id"]:
+        await update.message.reply_text("Only the bill creator can unassign items.")
         return
 
-    item["claimed_by"].append({"user_id": int(target_uid), "name": target_name})
-    save_bill(bill)
-    await update.message.reply_text(
-        f"✅ Assigned `#{item['id']}` {item['name']} → *{target_name}*",
-        parse_mode="Markdown",
-    )
+    text = re.sub(r'^/unassign(@\w+)?\s*', '', update.message.text.strip())
+    parts = text.split(None, 1)
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "Usage: `/unassign 1 Name` or `/unassign 1 @user`",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        item_id = int(parts[0])
+    except ValueError:
+        await update.message.reply_text("Usage: `/unassign 1 Name`", parse_mode="Markdown")
+        return
+
+    item = get_item(bill, item_id)
+    if not item:
+        await update.message.reply_text(f"Item #{item_id} not found.")
+        return
+
+    target = parts[1].strip()
+    removed = False
+    for i, c in enumerate(item["claimed_by"]):
+        cname = c["name"]
+        if target.startswith("@"):
+            if cname.lower() == target.lower():
+                item["claimed_by"].pop(i)
+                removed = True
+                break
+        else:
+            if cname.lower() == target.lower():
+                item["claimed_by"].pop(i)
+                removed = True
+                break
+
+    if removed:
+        save_bill(bill)
+        await update.message.reply_text(
+            f"✅ Removed {target} from `#{item['id']}` {item['name']}",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(f"{target} is not assigned to item #{item_id}.")
 
 
 async def cmd_resetpicks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1042,7 +1192,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = bill_total(b)
         created = b["created_at"]
         date_str = created.strftime("%Y-%m-%d %H:%M") if isinstance(created, datetime) else str(created)
-        members_count = len(b["members"])
+        members_count = len(b["members"]) + len(b.get("non_members", {}))
         items_count = len(b["items"])
         lines.append(
             f"• {date_str} — {symbol}{total:,.0f} "
@@ -1223,6 +1373,61 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+    elif data.startswith("assign:") and not data.startswith("assign:cancel"):
+        parts = data.split(":")
+        # assign:ITEM_ID:m:UID  or  assign:ITEM_ID:nm:NMID  or  assign:ITEM_ID:new
+        item_id = int(parts[1])
+        item = get_item(bill, item_id)
+        if not item:
+            await query.answer("Item not found.", show_alert=True)
+            return
+
+        if user.id != bill["creator_id"]:
+            await query.answer("Only the bill creator can assign.", show_alert=True)
+            return
+
+        action = parts[2]
+        if action == "m":
+            # Assign to member
+            target_uid = parts[3]
+            target_name = bill["members"].get(target_uid, "Unknown")
+            if any(str(c["user_id"]) == target_uid for c in item["claimed_by"]):
+                await query.answer(f"{target_name} already has this item.", show_alert=True)
+                return
+            item["claimed_by"].append({"user_id": target_uid, "name": target_name})
+            save_bill(bill)
+            symbol = "¥" if bill["currency"] == "JPY" else "฿"
+            await query.edit_message_text(
+                f"✅ Assigned `#{item['id']}` {item['name']} → *{target_name}*",
+                parse_mode="Markdown",
+            )
+
+        elif action == "nm":
+            # Assign to existing non-member
+            nm_id = parts[3]
+            nm_name = bill.get("non_members", {}).get(nm_id, "Unknown")
+            if any(str(c["user_id"]) == nm_id for c in item["claimed_by"]):
+                await query.answer(f"{nm_name} already has this item.", show_alert=True)
+                return
+            item["claimed_by"].append({"user_id": nm_id, "name": nm_name})
+            save_bill(bill)
+            await query.edit_message_text(
+                f"✅ Assigned `#{item['id']}` {item['name']} → *{nm_name}* (guest)",
+                parse_mode="Markdown",
+            )
+
+        elif action == "new":
+            # Prompt for non-member name
+            bill["awaiting_nm_name"] = item_id
+            save_bill(bill)
+            await query.edit_message_text(
+                f"Type the name of the non-member to assign `#{item['id']}` {item['name']} to:",
+                parse_mode="Markdown",
+            )
+
+    elif data == "assign:cancel":
+        await query.edit_message_text("❌ Assignment cancelled.")
+
     elif data == "finalize":
         if not bill["items"]:
             await query.answer("No items to finalize!", show_alert=True)
@@ -1326,7 +1531,59 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     bill = get_active_bill(chat_id)
-    if not bill or not bill.get("awaiting_manual_rate"):
+    if not bill:
+        return
+
+    # Handle non-member name input
+    if bill.get("awaiting_nm_name") is not None:
+        user = update.effective_user
+        if user.id != bill["creator_id"]:
+            return
+
+        item_id = bill["awaiting_nm_name"]
+        item = get_item(bill, item_id)
+        if not item:
+            bill["awaiting_nm_name"] = None
+            save_bill(bill)
+            await update.message.reply_text("Item not found. Assignment cancelled.")
+            return
+
+        nm_name = update.message.text.strip()
+        if not nm_name:
+            await update.message.reply_text("Please type a name.")
+            return
+
+        # Find or create non-member
+        nm_id = None
+        for nid, nname in bill.get("non_members", {}).items():
+            if nname.lower() == nm_name.lower():
+                nm_id = nid
+                nm_name = nname
+                break
+        if nm_id is None:
+            nm_id = f"nm_{bill.get('next_nm_id', 1)}"
+            bill["next_nm_id"] = bill.get("next_nm_id", 1) + 1
+            if "non_members" not in bill:
+                bill["non_members"] = {}
+            bill["non_members"][nm_id] = nm_name
+
+        if any(str(c["user_id"]) == nm_id for c in item["claimed_by"]):
+            bill["awaiting_nm_name"] = None
+            save_bill(bill)
+            await update.message.reply_text(f"{nm_name} already has item #{item['id']}.")
+            return
+
+        item["claimed_by"].append({"user_id": nm_id, "name": nm_name})
+        bill["awaiting_nm_name"] = None
+        save_bill(bill)
+        await update.message.reply_text(
+            f"✅ Assigned `#{item['id']}` {item['name']} → *{nm_name}* (guest)",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Handle manual rate input
+    if not bill.get("awaiting_manual_rate"):
         return
 
     text = update.message.text.strip().replace(",", "")
@@ -1368,6 +1625,7 @@ def main():
     app.add_handler(CommandHandler("pick", cmd_pick))
     app.add_handler(CommandHandler("unpick", cmd_unpick))
     app.add_handler(CommandHandler("assign", cmd_assign))
+    app.add_handler(CommandHandler("unassign", cmd_unassign))
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("history", cmd_history))
