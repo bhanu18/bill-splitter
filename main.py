@@ -1143,10 +1143,14 @@ async def cmd_setfees(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    user = update.effective_user
     bill = get_active_bill(chat_id)
 
     if not bill:
         await update.message.reply_text("No active bill.")
+        return
+    if user.id != bill["creator_id"]:
+        await update.message.reply_text("Only the bill creator can finalize the bill.")
         return
     if not bill["items"]:
         await update.message.reply_text("No items in the bill yet!")
@@ -1429,6 +1433,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Assignment cancelled.")
 
     elif data == "finalize":
+        if user.id != bill["creator_id"]:
+            await query.answer("Only the bill creator can finalize.", show_alert=True)
+            return
         if not bill["items"]:
             await query.answer("No items to finalize!", show_alert=True)
             return
