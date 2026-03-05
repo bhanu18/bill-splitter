@@ -1,30 +1,3 @@
-"""
-Telegram Bill Splitter Bot (with MongoDB persistence)
-=====================================================
-A group chat bot that lets members split bills item-by-item.
-
-Features:
-- Upload receipt photo (OCR) or manually add items
-- THB / JPY currency with auto or manual JPY->THB conversion
-- Anyone can /join a bill, pick items via inline buttons
-- Creator can assign items to members
-- Final summary with per-person totals
-- MongoDB persistence -- bills survive restarts
-
-Commands:
-  /newbill    - Start a new bill session
-  /join       - Join the current bill
-  /additem    - Add item manually: /additem <n> <price>
-  /items      - Show all items with pick buttons
-  /pick       - Pick item by number: /pick <number>
-  /assign     - Assign item: /assign <number> @user
-  /unpick     - Remove yourself from item: /unpick <number>
-  /done       - Finalize bill and show summary
-  /cancel     - Cancel current bill
-  /history    - Show past bills in this chat
-  /help       - Show help message
-"""
-
 import os
 import re
 import io
@@ -210,7 +183,6 @@ def person_fee_breakdown(bill, user_id):
 
 
 # --- Helpers ---
-
 def get_display_name(user):
     if user.username:
         return f"@{user.username}"
@@ -419,7 +391,6 @@ async def parse_receipt_ocr(image_bytes, currency):
 
 
 # --- Keyboards ---
-
 def currency_keyboard():
     return InlineKeyboardMarkup([
         [
@@ -493,22 +464,22 @@ def items_keyboard(bill):
     return InlineKeyboardMarkup(buttons)
 
 
-def assign_keyboard(bill, item_id):
-    """Inline buttons to assign an item: members + non-members + add new."""
+def assign_keyboard(bill, ids_str):
+    """Inline buttons to assign item(s): members + non-members + add new. ids_str can be '1' or '1,2,3'."""
     buttons = []
     # Existing members
     for uid_str, name in bill["members"].items():
         buttons.append([InlineKeyboardButton(
-            f"👤 {name}", callback_data=f"assign:{item_id}:m:{uid_str}"
+            f"👤 {name}", callback_data=f"assign:{ids_str}:m:{uid_str}"
         )])
     # Existing non-members
     for nm_id, name in bill.get("non_members", {}).items():
         buttons.append([InlineKeyboardButton(
-            f"👥 {name} (guest)", callback_data=f"assign:{item_id}:nm:{nm_id}"
+            f"👥 {name} (guest)", callback_data=f"assign:{ids_str}:nm:{nm_id}"
         )])
     # Add new non-member
     buttons.append([InlineKeyboardButton(
-        "➕ Add non-member (type name)", callback_data=f"assign:{item_id}:new"
+        "➕ Add non-member (type name)", callback_data=f"assign:{ids_str}:new"
     )])
     buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="assign:cancel")])
     return InlineKeyboardMarkup(buttons)
@@ -888,31 +859,53 @@ async def cmd_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Usage:\n"
             "`/assign 1` — pick from list\n"
-            "`/assign 1 @user` — assign to member\n"
-            "`/assign 1 John` — assign to non-member",
+            "`/assign 1,2,3` — pick from list (multiple)\n"
+            "`/assign 1,2 @user` — assign to member\n"
+            "`/assign 1,2 John` — assign to non-member",
             parse_mode="Markdown",
         )
         return
 
     parts = text.split(None, 1)
+    # Parse item IDs (comma-separated)
     try:
-        item_id = int(parts[0])
+        item_ids = [int(x.strip()) for x in parts[0].split(",") if x.strip()]
+        if not item_ids:
+            raise ValueError
     except ValueError:
-        await update.message.reply_text("Usage: `/assign 1` or `/assign 1 Name`", parse_mode="Markdown")
-        return
-
-    item = get_item(bill, item_id)
-    if not item:
-        await update.message.reply_text(f"Item #{item_id} not found.")
-        return
-
-    # Just item number — show picker
-    if len(parts) == 1:
-        symbol = "¥" if bill["currency"] == "JPY" else "฿"
         await update.message.reply_text(
-            f"Assign `#{item['id']}` {item['name']} ({symbol}{item['price']:,.0f}) to:",
+            "Usage: `/assign 1,2,3` or `/assign 1,2 Name`",
             parse_mode="Markdown",
-            reply_markup=assign_keyboard(bill, item_id),
+        )
+        return
+
+    # Validate all items exist
+    items = []
+    for iid in item_ids:
+        item = get_item(bill, iid)
+        if not item:
+            await update.message.reply_text(f"Item #{iid} not found.")
+            return
+        items.append(item)
+
+    ids_str = ",".join(str(i) for i in item_ids)
+    symbol = "¥" if bill["currency"] == "JPY" else "฿"
+
+    # Just item numbers — show picker
+    if len(parts) == 1:
+        # Check if ids_str fits in Telegram's 64-byte callback limit
+        if len(ids_str) > 40:
+            await update.message.reply_text(
+                "Too many items for button picker.\n"
+                f"Use: `/assign {ids_str} Name` or `/assign {ids_str} @user`",
+                parse_mode="Markdown",
+            )
+            return
+        item_lines = "\n".join(f"  `#{i['id']}` {i['name']} ({symbol}{i['price']:,.0f})" for i in items)
+        await update.message.reply_text(
+            f"Assign {len(items)} item(s) to:\n{item_lines}",
+            parse_mode="Markdown",
+            reply_markup=assign_keyboard(bill, ids_str),
         )
         return
 
@@ -932,26 +925,32 @@ async def cmd_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not target_uid:
             await update.message.reply_text(f"@{target_username} hasn't joined. They need to /join first.")
             return
-        if any(str(c["user_id"]) == target_uid for c in item["claimed_by"]):
-            await update.message.reply_text(f"{target_name} already has item #{item['id']}.")
-            return
-        item["claimed_by"].append({"user_id": target_uid, "name": target_name})
+        assigned = []
+        skipped = []
+        for item in items:
+            if any(str(c["user_id"]) == target_uid for c in item["claimed_by"]):
+                skipped.append(item)
+            else:
+                item["claimed_by"].append({"user_id": target_uid, "name": target_name})
+                assigned.append(item)
         save_bill(bill)
-        await update.message.reply_text(
-            f"✅ Assigned `#{item['id']}` {item['name']} → *{target_name}*",
-            parse_mode="Markdown",
-        )
+        lines = []
+        if assigned:
+            items_text = ", ".join(f"`#{i['id']}`" for i in assigned)
+            lines.append(f"✅ Assigned {items_text} → *{target_name}*")
+        if skipped:
+            items_text = ", ".join(f"`#{i['id']}`" for i in skipped)
+            lines.append(f"⏭ Skipped {items_text} (already assigned)")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     else:
         # Assign to non-member by name
         nm_name = target
-        # Find existing non-member with this name
         nm_id = None
         for nid, nname in bill.get("non_members", {}).items():
             if nname.lower() == nm_name.lower():
                 nm_id = nid
-                nm_name = nname  # preserve original casing
+                nm_name = nname
                 break
-        # Create new non-member if not found
         if nm_id is None:
             nm_id = f"nm_{bill.get('next_nm_id', 1)}"
             bill["next_nm_id"] = bill.get("next_nm_id", 1) + 1
@@ -959,19 +958,27 @@ async def cmd_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 bill["non_members"] = {}
             bill["non_members"][nm_id] = nm_name
 
-        if any(str(c["user_id"]) == nm_id for c in item["claimed_by"]):
-            await update.message.reply_text(f"{nm_name} already has item #{item['id']}.")
-            return
-        item["claimed_by"].append({"user_id": nm_id, "name": nm_name})
+        assigned = []
+        skipped = []
+        for item in items:
+            if any(str(c["user_id"]) == nm_id for c in item["claimed_by"]):
+                skipped.append(item)
+            else:
+                item["claimed_by"].append({"user_id": nm_id, "name": nm_name})
+                assigned.append(item)
         save_bill(bill)
-        await update.message.reply_text(
-            f"✅ Assigned `#{item['id']}` {item['name']} → *{nm_name}* (guest)",
-            parse_mode="Markdown",
-        )
+        lines = []
+        if assigned:
+            items_text = ", ".join(f"`#{i['id']}`" for i in assigned)
+            lines.append(f"✅ Assigned {items_text} → *{nm_name}* (guest)")
+        if skipped:
+            items_text = ", ".join(f"`#{i['id']}`" for i in skipped)
+            lines.append(f"⏭ Skipped {items_text} (already assigned)")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_unassign(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Creator removes someone's assignment from an item."""
+    """Creator removes someone's assignment from item(s)."""
     chat_id = update.effective_chat.id
     user = update.effective_user
     bill = get_active_bill(chat_id)
@@ -987,45 +994,45 @@ async def cmd_unassign(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = text.split(None, 1)
     if len(parts) < 2:
         await update.message.reply_text(
-            "Usage: `/unassign 1 Name` or `/unassign 1 @user`",
+            "Usage: `/unassign 1,2 Name` or `/unassign 1 @user`",
             parse_mode="Markdown",
         )
         return
 
     try:
-        item_id = int(parts[0])
+        item_ids = [int(x.strip()) for x in parts[0].split(",") if x.strip()]
+        if not item_ids:
+            raise ValueError
     except ValueError:
-        await update.message.reply_text("Usage: `/unassign 1 Name`", parse_mode="Markdown")
-        return
-
-    item = get_item(bill, item_id)
-    if not item:
-        await update.message.reply_text(f"Item #{item_id} not found.")
+        await update.message.reply_text("Usage: `/unassign 1,2 Name`", parse_mode="Markdown")
         return
 
     target = parts[1].strip()
-    removed = False
-    for i, c in enumerate(item["claimed_by"]):
-        cname = c["name"]
-        if target.startswith("@"):
-            if cname.lower() == target.lower():
+    removed = []
+    not_found = []
+    for iid in item_ids:
+        item = get_item(bill, iid)
+        if not item:
+            not_found.append(iid)
+            continue
+        was_removed = False
+        for i, c in enumerate(item["claimed_by"]):
+            if c["name"].lower() == target.lower():
                 item["claimed_by"].pop(i)
-                removed = True
-                break
-        else:
-            if cname.lower() == target.lower():
-                item["claimed_by"].pop(i)
-                removed = True
+                removed.append(item)
+                was_removed = True
                 break
 
+    save_bill(bill)
+    lines = []
     if removed:
-        save_bill(bill)
-        await update.message.reply_text(
-            f"✅ Removed {target} from `#{item['id']}` {item['name']}",
-            parse_mode="Markdown",
-        )
-    else:
-        await update.message.reply_text(f"{target} is not assigned to item #{item_id}.")
+        items_text = ", ".join(f"`#{i['id']}`" for i in removed)
+        lines.append(f"✅ Removed {target} from {items_text}")
+    if not_found:
+        lines.append(f"⚠️ Items not found: {', '.join(f'#{x}' for x in not_found)}")
+    if not removed and not not_found:
+        lines.append(f"{target} is not assigned to those items.")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_resetpicks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1378,12 +1385,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     elif data.startswith("assign:") and not data.startswith("assign:cancel"):
+        # Format: assign:IDS_STR:ACTION:TARGET
+        # IDS_STR can be "1" or "1,2,3"
         parts = data.split(":")
-        # assign:ITEM_ID:m:UID  or  assign:ITEM_ID:nm:NMID  or  assign:ITEM_ID:new
-        item_id = int(parts[1])
-        item = get_item(bill, item_id)
-        if not item:
-            await query.answer("Item not found.", show_alert=True)
+        ids_str = parts[1]
+        item_ids = [int(x) for x in ids_str.split(",")]
+        items_found = []
+        for iid in item_ids:
+            item = get_item(bill, iid)
+            if item:
+                items_found.append(item)
+        if not items_found:
+            await query.answer("Items not found.", show_alert=True)
             return
 
         if user.id != bill["creator_id"]:
@@ -1392,40 +1405,51 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         action = parts[2]
         if action == "m":
-            # Assign to member
             target_uid = parts[3]
             target_name = bill["members"].get(target_uid, "Unknown")
-            if any(str(c["user_id"]) == target_uid for c in item["claimed_by"]):
-                await query.answer(f"{target_name} already has this item.", show_alert=True)
-                return
-            item["claimed_by"].append({"user_id": target_uid, "name": target_name})
+            assigned = []
+            for item in items_found:
+                if not any(str(c["user_id"]) == target_uid for c in item["claimed_by"]):
+                    item["claimed_by"].append({"user_id": target_uid, "name": target_name})
+                    assigned.append(item)
             save_bill(bill)
-            symbol = "¥" if bill["currency"] == "JPY" else "฿"
-            await query.edit_message_text(
-                f"✅ Assigned `#{item['id']}` {item['name']} → *{target_name}*",
-                parse_mode="Markdown",
-            )
+            if assigned:
+                items_text = ", ".join(f"`#{i['id']}`" for i in assigned)
+                await query.edit_message_text(
+                    f"✅ Assigned {items_text} → *{target_name}*",
+                    parse_mode="Markdown",
+                )
+            else:
+                await query.answer(f"{target_name} already has all these items.", show_alert=True)
 
         elif action == "nm":
-            # Assign to existing non-member
             nm_id = parts[3]
             nm_name = bill.get("non_members", {}).get(nm_id, "Unknown")
-            if any(str(c["user_id"]) == nm_id for c in item["claimed_by"]):
-                await query.answer(f"{nm_name} already has this item.", show_alert=True)
-                return
-            item["claimed_by"].append({"user_id": nm_id, "name": nm_name})
+            assigned = []
+            for item in items_found:
+                if not any(str(c["user_id"]) == nm_id for c in item["claimed_by"]):
+                    item["claimed_by"].append({"user_id": nm_id, "name": nm_name})
+                    assigned.append(item)
             save_bill(bill)
-            await query.edit_message_text(
-                f"✅ Assigned `#{item['id']}` {item['name']} → *{nm_name}* (guest)",
-                parse_mode="Markdown",
-            )
+            if assigned:
+                items_text = ", ".join(f"`#{i['id']}`" for i in assigned)
+                await query.edit_message_text(
+                    f"✅ Assigned {items_text} → *{nm_name}* (guest)",
+                    parse_mode="Markdown",
+                )
+            else:
+                await query.answer(f"{nm_name} already has all these items.", show_alert=True)
 
         elif action == "new":
-            # Prompt for non-member name
-            bill["awaiting_nm_name"] = item_id
+            # Prompt for non-member name — store ids_str
+            bill["awaiting_nm_name"] = ids_str
             save_bill(bill)
+            if len(items_found) == 1:
+                label = f"`#{items_found[0]['id']}` {items_found[0]['name']}"
+            else:
+                label = ", ".join(f"`#{i['id']}`" for i in items_found)
             await query.edit_message_text(
-                f"Type the name of the non-member to assign `#{item['id']}` {item['name']} to:",
+                f"Type the name of the non-member to assign {label} to:",
                 parse_mode="Markdown",
             )
 
@@ -1547,12 +1571,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user.id != bill["creator_id"]:
             return
 
-        item_id = bill["awaiting_nm_name"]
-        item = get_item(bill, item_id)
-        if not item:
+        ids_str = str(bill["awaiting_nm_name"])
+        item_ids = [int(x) for x in ids_str.split(",")]
+        items_found = [get_item(bill, iid) for iid in item_ids]
+        items_found = [i for i in items_found if i]
+        if not items_found:
             bill["awaiting_nm_name"] = None
             save_bill(bill)
-            await update.message.reply_text("Item not found. Assignment cancelled.")
+            await update.message.reply_text("Items not found. Assignment cancelled.")
             return
 
         nm_name = update.message.text.strip()
@@ -1574,19 +1600,22 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 bill["non_members"] = {}
             bill["non_members"][nm_id] = nm_name
 
-        if any(str(c["user_id"]) == nm_id for c in item["claimed_by"]):
-            bill["awaiting_nm_name"] = None
-            save_bill(bill)
-            await update.message.reply_text(f"{nm_name} already has item #{item['id']}.")
-            return
+        assigned = []
+        for item in items_found:
+            if not any(str(c["user_id"]) == nm_id for c in item["claimed_by"]):
+                item["claimed_by"].append({"user_id": nm_id, "name": nm_name})
+                assigned.append(item)
 
-        item["claimed_by"].append({"user_id": nm_id, "name": nm_name})
         bill["awaiting_nm_name"] = None
         save_bill(bill)
-        await update.message.reply_text(
-            f"✅ Assigned `#{item['id']}` {item['name']} → *{nm_name}* (guest)",
-            parse_mode="Markdown",
-        )
+        if assigned:
+            items_text = ", ".join(f"`#{i['id']}`" for i in assigned)
+            await update.message.reply_text(
+                f"✅ Assigned {items_text} → *{nm_name}* (guest)",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(f"{nm_name} already has all those items.")
         return
 
     # Handle manual rate input
