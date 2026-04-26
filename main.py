@@ -55,6 +55,7 @@ def new_bill_doc(chat_id, creator_id, creator_name):
         "service_charge_pct": None,  # e.g. 10.0 for 10%
         "vat_pct": None,             # e.g. 7.0 for 7%
         "fees_mode": None,           # "both_inclusive", "sc_exclusive_vat_inclusive", "both_exclusive", or None
+        "bill_discount": 0,          # Bill-level discount amount (e.g. 300 for KTC -300)
         "items": [],
         "members": {str(creator_id): creator_name},
         "non_members": {},           # {"nm_1": "John", "nm_2": "Jane"}
@@ -118,25 +119,33 @@ def bill_total(bill):
 
 
 def bill_grand_total(bill):
-    """Total including service charge and VAT based on fees_mode."""
+    """Total including service charge, VAT, minus bill discount."""
     subtotal = bill_total(bill)
     sc_pct = bill.get("service_charge_pct") or 0
     vat_pct = bill.get("vat_pct") or 0
     mode = bill.get("fees_mode")
+    discount = bill.get("bill_discount") or 0
 
     if mode == "both_inclusive":
-        return subtotal
+        before_discount = subtotal
     elif mode == "sc_exclusive_vat_inclusive":
-        return subtotal * (1 + sc_pct / 100)
+        before_discount = subtotal * (1 + sc_pct / 100)
     elif mode == "both_exclusive":
         after_sc = subtotal * (1 + sc_pct / 100)
-        return after_sc * (1 + vat_pct / 100)
+        before_discount = after_sc * (1 + vat_pct / 100)
     else:
-        return subtotal
+        before_discount = subtotal
+
+    return before_discount - discount
+
+
+def bill_total_before_discount(bill):
+    """Total after fees but BEFORE bill discount."""
+    return bill_grand_total(bill) + (bill.get("bill_discount") or 0)
 
 
 def person_grand_total(bill, user_id):
-    """Person's total including proportional service charge and VAT."""
+    """Person's total including proportional fees and discount."""
     subtotal = bill_total(bill)
     if subtotal == 0:
         return 0
@@ -146,43 +155,47 @@ def person_grand_total(bill, user_id):
 
 
 def person_fee_breakdown(bill, user_id):
-    """Return (item_subtotal, sc_amount, vat_amount, total) for a person."""
+    """Return (item_subtotal, sc_amount, vat_amount, discount_share, total) for a person."""
     subtotal = bill_total(bill)
     if subtotal == 0:
-        return 0, 0, 0, 0
+        return 0, 0, 0, 0, 0
     p_sub = person_total(bill, user_id)
+    ratio = p_sub / subtotal
     sc_pct = bill.get("service_charge_pct") or 0
     vat_pct = bill.get("vat_pct") or 0
     mode = bill.get("fees_mode")
+    discount = bill.get("bill_discount") or 0
 
     if mode == "both_inclusive":
-        # Back-calculate: price = base * (1+sc%) * (1+vat%)
         divisor = (1 + sc_pct / 100) * (1 + vat_pct / 100)
         base = p_sub / divisor if divisor else p_sub
         sc_amt = base * sc_pct / 100
         vat_amt = (base + sc_amt) * vat_pct / 100
-        return p_sub, sc_amt, vat_amt, p_sub
+        disc_share = discount * ratio
+        return p_sub, sc_amt, vat_amt, disc_share, p_sub - disc_share
 
     elif mode == "sc_exclusive_vat_inclusive":
-        # SC added on top, VAT is inside the total (total = subtotal + SC)
-        total = p_sub * (1 + sc_pct / 100)
+        before_disc = p_sub * (1 + sc_pct / 100)
         sc_amt = p_sub * sc_pct / 100
-        # Back-calculate VAT from total: total = before_vat * (1+vat%)
-        before_vat = total / (1 + vat_pct / 100) if vat_pct else total
-        vat_amt = total - before_vat
-        return p_sub, sc_amt, vat_amt, total
+        before_vat = before_disc / (1 + vat_pct / 100) if vat_pct else before_disc
+        vat_amt = before_disc - before_vat
+        disc_share = discount * ratio
+        return p_sub, sc_amt, vat_amt, disc_share, before_disc - disc_share
 
     elif mode == "both_exclusive":
         sc_amt = p_sub * sc_pct / 100
         vat_amt = (p_sub + sc_amt) * vat_pct / 100
-        total = p_sub + sc_amt + vat_amt
-        return p_sub, sc_amt, vat_amt, total
+        before_disc = p_sub + sc_amt + vat_amt
+        disc_share = discount * ratio
+        return p_sub, sc_amt, vat_amt, disc_share, before_disc - disc_share
 
     else:
-        return p_sub, 0, 0, p_sub
+        disc_share = discount * ratio
+        return p_sub, 0, 0, disc_share, p_sub - disc_share
 
 
 # --- Helpers ---
+
 def get_display_name(user):
     if user.username:
         return f"@{user.username}"
@@ -228,17 +241,27 @@ async def parse_receipt_ocr(image_bytes, currency):
         "Respond ONLY with a JSON object, no other text, no markdown.\n\n"
         "Format:\n"
         '{"items": [{"name": "item name", "price": 123.45}, ...], '
-        '"service_charge_pct": null, "vat_pct": null, "fees_mode": null}\n\n'
+        '"service_charge_pct": null, "vat_pct": null, "fees_mode": null, '
+        '"bill_discount": 0}\n\n'
         "Rules:\n"
         "- Include individual items only, not subtotals/totals/tax/service charge lines\n"
         "- Use the original item name from the receipt\n"
-        "- Price should be a number without currency symbols\n"
-        "- DISCOUNTS: If an item has a discount (e.g. '10% off', promo, member price), "
-        "use the NET price after discount. For example if item is 100 with -10 discount, "
-        "the price should be 90. If some items are discounted and others are not, "
-        "use net price for discounted items and original price for non-discounted items.\n"
-        "- Do NOT include discount lines as separate items.\n"
-        "- The sum of all item prices should equal the receipt's subtotal AFTER discount.\n"
+        "- Price should be a number without currency symbols\n\n"
+        "CRITICAL — PER-ITEM DISCOUNTS & MODIFIERS:\n"
+        "- Many receipts show modifiers or add-ons below an item with 0.00 price "
+        "(e.g. spice level, cup size) — IGNORE these 0.00 lines.\n"
+        "- If a NEGATIVE number appears below an item (e.g. -20.00 for '@Rice 150g', "
+        "or -48.00 for '#Pro UOB 10% off'), this is a PER-ITEM DISCOUNT. "
+        "SUBTRACT it from the item above. Example: item 215.00 with -20.00 below → price = 195.\n"
+        "- Do NOT include modifier or discount lines as separate items.\n"
+        "- The sum of all extracted item prices MUST equal the receipt's SubTotal line.\n\n"
+        "BILL-LEVEL DISCOUNT:\n"
+        "- If the receipt shows a discount AFTER the subtotal/total line "
+        "(e.g. 'KTC Discount -300', 'Credit Card Promotion -500', 'Voucher -100'), "
+        "put the ABSOLUTE amount (positive number) in bill_discount. Example: -300 → bill_discount: 300.\n"
+        "- bill_discount is 0 if there is no bill-level discount.\n"
+        "- Do NOT subtract bill_discount from item prices.\n\n"
+        "FEES:\n"
         "- For service_charge_pct: if the receipt shows a service charge, "
         "put the percentage as a number (e.g. 10 for 10%). Otherwise null.\n"
         "- For vat_pct: if the receipt shows VAT/tax, "
@@ -252,13 +275,14 @@ async def parse_receipt_ocr(image_bytes, currency):
         '  "both_exclusive" — both SC and VAT are added on top. '
         "TOTAL = subtotal + SC + VAT.\n"
         "  null — if you cannot determine.\n"
-        "- To detect fees_mode: use the AFTER-DISCOUNT subtotal as the base. "
-        "Compare it to the TOTAL on the receipt. "
+        "- To detect fees_mode: use the AFTER per-item-discount subtotal as the base "
+        "(BEFORE any bill-level discount). "
         "If TOTAL = subtotal → both_inclusive. "
-        "If TOTAL = subtotal + SC (and VAT is shown as breakdown) → sc_exclusive_vat_inclusive. "
+        "If TOTAL = subtotal + SC → sc_exclusive_vat_inclusive. "
         "If TOTAL = subtotal + SC + VAT → both_exclusive.\n"
         "- If you can't read the receipt clearly, return: "
-        '{"items": [], "service_charge_pct": null, "vat_pct": null, "fees_mode": null}\n'
+        '{"items": [], "service_charge_pct": null, "vat_pct": null, '
+        '"fees_mode": null, "bill_discount": 0}\n'
     )
 
     try:
@@ -356,17 +380,19 @@ async def parse_receipt_ocr(image_bytes, currency):
                 items.append((m.group(1), float(m.group(2))))
             if items:
                 logger.info(f"Regex fallback extracted {len(items)} items")
-                return items, None, None, None
-            return [], None, None, None
+                return items, None, None, None, 0
+            return [], None, None, None, 0
 
         # Handle both formats: new dict format and legacy array format
         sc_pct = None
         vat_pct = None
         fees_mode = None
+        bill_discount = 0
         if isinstance(items_data, dict):
             sc_pct = items_data.get("service_charge_pct")
             vat_pct = items_data.get("vat_pct")
             fees_mode = items_data.get("fees_mode")
+            bill_discount = float(items_data.get("bill_discount") or 0)
             items_list = items_data.get("items", [])
         else:
             items_list = items_data
@@ -378,8 +404,8 @@ async def parse_receipt_ocr(image_bytes, currency):
             if name and price > 0:
                 items.append((name, price))
 
-        logger.info(f"Gemini extracted {len(items)} items, sc={sc_pct}%, vat={vat_pct}%, mode={fees_mode}")
-        return items, sc_pct, vat_pct, fees_mode
+        logger.info(f"Gemini extracted {len(items)} items, sc={sc_pct}%, vat={vat_pct}%, mode={fees_mode}, bill_discount={bill_discount}")
+        return items, sc_pct, vat_pct, fees_mode, bill_discount
 
     except Exception as e:
         logger.error(f"Gemini API error: {e}")
@@ -387,10 +413,11 @@ async def parse_receipt_ocr(image_bytes, currency):
             logger.error(f"Response body: {resp.text[:500]}")
         except Exception:
             pass
-        return [], None, None, None
+        return [], None, None, None, 0
 
 
 # --- Keyboards ---
+
 def currency_keyboard():
     return InlineKeyboardMarkup([
         [
@@ -465,7 +492,8 @@ def items_keyboard(bill):
 
 
 def assign_keyboard(bill, ids_str):
-    """Inline buttons to assign item(s): members + non-members + add new. ids_str can be '1' or '1,2,3'."""
+    """Inline buttons to assign item(s): members + non-members + add new.
+    ids_str can be '1' or '1,2,3'."""
     buttons = []
     # Existing members
     for uid_str, name in bill["members"].items():
@@ -517,6 +545,7 @@ def format_summary(bill):
     sc_pct = bill.get("service_charge_pct") or 0
     vat_pct = bill.get("vat_pct") or 0
     mode = bill.get("fees_mode")
+    discount = bill.get("bill_discount") or 0
     lines = []
 
     lines.append("💸 *BILL SPLIT SUMMARY*")
@@ -532,6 +561,7 @@ def format_summary(bill):
 
     if mode and (sc_pct or vat_pct):
         mode_label = FEES_MODE_LABELS.get(mode, "")
+        before_discount = bill_total_before_discount(bill)
 
         if mode == "both_inclusive":
             divisor = (1 + sc_pct / 100) * (1 + vat_pct / 100)
@@ -552,7 +582,7 @@ def format_summary(bill):
             lines.append(f"💰 Subtotal: {symbol}{subtotal:,.0f}")
             if sc_pct:
                 lines.append(f"🧾 + SC {sc_pct:.0f}%: {symbol}{sc_amount:,.0f}")
-            lines.append(f"💰 *Total: {symbol}{grand:,.0f}* ({mode_label})")
+            lines.append(f"💰 *Total: {symbol}{before_discount:,.0f}* ({mode_label})")
             if vat_pct:
                 lines.append(f"    ↳ VAT {vat_pct:.0f}%: {symbol}{vat_amount:,.0f}")
 
@@ -564,9 +594,19 @@ def format_summary(bill):
                 lines.append(f"🧾 + SC {sc_pct:.0f}%: {symbol}{sc_amount:,.0f}")
             if vat_pct:
                 lines.append(f"🧾 + VAT {vat_pct:.0f}%: {symbol}{vat_amount:,.0f}")
-            lines.append(f"💰 *Grand Total: {symbol}{grand:,.0f}*")
+            if discount:
+                lines.append(f"💰 Before discount: {symbol}{before_discount:,.0f}")
+            else:
+                lines.append(f"💰 *Grand Total: {symbol}{before_discount:,.0f}*")
+
+        if discount:
+            lines.append(f"🏷️ Discount: -{symbol}{discount:,.0f}")
+            lines.append(f"💰 *Pay: {symbol}{grand:,.0f}*")
     else:
         lines.append(f"💰 *Total: {symbol}{subtotal:,.0f}*")
+        if discount:
+            lines.append(f"🏷️ Discount: -{symbol}{discount:,.0f}")
+            lines.append(f"💰 *Pay: {symbol}{grand:,.0f}*")
 
     if bill["currency"] == "JPY" and rate:
         thb_grand = grand * rate
@@ -593,7 +633,7 @@ def format_summary(bill):
                     person_items.append(f"    • {item['name']}: {symbol}{share:,.0f}{suffix}")
                     break
 
-        p_sub, p_sc, p_vat, p_total = person_fee_breakdown(bill, uid_str)
+        p_sub, p_sc, p_vat, p_disc, p_total = person_fee_breakdown(bill, uid_str)
         guest_tag = " _(guest)_" if is_guest else ""
         lines.append(f"👤 *{name}*{guest_tag}")
 
@@ -606,23 +646,25 @@ def format_summary(bill):
                         lines.append(f"    _(includes SC: {symbol}{p_sc:,.0f})_")
                     if vat_pct:
                         lines.append(f"    _(includes VAT: {symbol}{p_vat:,.0f})_")
-                    lines.append(f"    → *Pay: {symbol}{p_total:,.0f}*")
                 elif mode == "sc_exclusive_vat_inclusive":
                     lines.append(f"    Items: {symbol}{p_sub:,.0f}")
                     if sc_pct:
                         lines.append(f"    + SC {sc_pct:.0f}%: {symbol}{p_sc:,.0f}")
                     if vat_pct:
                         lines.append(f"    _(includes VAT: {symbol}{p_vat:,.0f})_")
-                    lines.append(f"    → *Pay: {symbol}{p_total:,.0f}*")
                 elif mode == "both_exclusive":
                     lines.append(f"    Items: {symbol}{p_sub:,.0f}")
                     if sc_pct:
                         lines.append(f"    + SC {sc_pct:.0f}%: {symbol}{p_sc:,.0f}")
                     if vat_pct:
                         lines.append(f"    + VAT {vat_pct:.0f}%: {symbol}{p_vat:,.0f}")
-                    lines.append(f"    → *Pay: {symbol}{p_total:,.0f}*")
+                if discount and p_disc > 0:
+                    lines.append(f"    🏷️ discount: -{symbol}{p_disc:,.0f}")
+                lines.append(f"    → *Pay: {symbol}{p_total:,.0f}*")
             else:
-                lines.append(f"    → *Pay: {symbol}{p_sub:,.0f}*")
+                if discount and p_disc > 0:
+                    lines.append(f"    🏷️ discount: -{symbol}{p_disc:,.0f}")
+                lines.append(f"    → *Pay: {symbol}{p_total:,.0f}*")
             if bill["currency"] == "JPY" and rate:
                 thb_amount = p_total * rate
                 lines.append(f"    _(≈ ฿{thb_amount:,.2f})_")
@@ -666,11 +708,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/unassign `number Name` — Remove assignment\n\n"
         "*Finish:*\n"
         "/done — Finalize and show summary\n"
+        "/reopen — Reopen last finalized bill\n"
         "/cancel — Cancel current bill\n"
         "/history — View past bills\n"
         "/setfees `sc vat mode` — Set fees\n"
         "  _Modes:_ `both_inc` / `sc_exc` / `both_exc`\n"
-        "  _Example:_ `/setfees 10 7 both_exc`\n\n"
+        "  _Example:_ `/setfees 10 7 both_exc`\n"
+        "/setdiscount `amount` — Set bill-level discount\n"
+        "  _Example:_ `/setdiscount 300`\n\n"
         "*Currencies:* THB 🇹🇭 and JPY 🇯🇵\n"
         "AI reads fees from receipt and asks for confirmation.\n"
         "Use /setfees to adjust anytime."
@@ -1148,6 +1193,48 @@ async def cmd_setfees(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
+async def cmd_setdiscount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    bill = get_active_bill(chat_id)
+
+    if not bill:
+        await update.message.reply_text("No active bill.")
+        return
+
+    text = re.sub(r'^/setdiscount(@\w+)?\s*', '', update.message.text.strip())
+    if not text:
+        current = bill.get("bill_discount") or 0
+        symbol = "¥" if bill["currency"] == "JPY" else "฿"
+        await update.message.reply_text(
+            f"Current bill discount: {symbol}{current:,.0f}\n\n"
+            "Usage: `/setdiscount 300` — set discount amount\n"
+            "To clear: `/setdiscount 0`",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        amount = float(text.replace(",", ""))
+        if amount < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Usage: `/setdiscount 300`", parse_mode="Markdown")
+        return
+
+    bill["bill_discount"] = amount
+    save_bill(bill)
+
+    symbol = "¥" if bill["currency"] == "JPY" else "฿"
+    if amount > 0:
+        await update.message.reply_text(
+            f"🏷️ Bill discount set: -{symbol}{amount:,.0f}\n"
+            f"💰 Total after discount: {symbol}{bill_grand_total(bill):,.0f}",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text("✅ Bill discount cleared.", parse_mode="Markdown")
+
+
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
@@ -1167,6 +1254,38 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bill["finalized_at"] = datetime.now(timezone.utc)
     save_bill(bill)
     await update.message.reply_text(format_summary(bill), parse_mode="Markdown")
+
+
+async def cmd_reopen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    # Check no active bill already
+    active = get_active_bill(chat_id)
+    if active:
+        await update.message.reply_text("There's already an active bill. /cancel it first to reopen a previous one.")
+        return
+
+    # Find the most recent finalized bill in this chat
+    bill = bills_col.find_one(
+        {"chat_id": chat_id, "is_finalized": True},
+        sort=[("finalized_at", -1)],
+    )
+    if not bill:
+        await update.message.reply_text("No finalized bill to reopen.")
+        return
+    if user.id != bill["creator_id"]:
+        await update.message.reply_text("Only the bill creator can reopen.")
+        return
+
+    bill["is_finalized"] = False
+    bill.pop("finalized_at", None)
+    save_bill(bill)
+    await update.message.reply_text(
+        "🔓 Bill reopened! You can now /assign, /pick, /setfees, etc.\n"
+        "Use /done when ready to finalize again.",
+        parse_mode="Markdown",
+    )
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1486,7 +1605,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo_bytes = await file.download_as_bytearray()
 
     msg = await update.message.reply_text("🔍 Reading receipt with Gemini AI...")
-    items, sc_pct, vat_pct, fees_mode = await parse_receipt_ocr(bytes(photo_bytes), bill["currency"])
+    items, sc_pct, vat_pct, fees_mode, bill_discount = await parse_receipt_ocr(bytes(photo_bytes), bill["currency"])
 
     if not items:
         await msg.edit_text(
@@ -1500,6 +1619,10 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     detected_sc = sc_pct if sc_pct is not None else None
     detected_vat = vat_pct if vat_pct is not None else None
 
+    # Store bill discount
+    if bill_discount > 0:
+        bill["bill_discount"] = bill_discount
+
     symbol = "¥" if bill["currency"] == "JPY" else "฿"
     added_lines = []
     for name, price in items:
@@ -1512,6 +1635,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + "\n".join(added_lines)
         + f"\n\n💰 Subtotal: {symbol}{total:,.0f}"
     )
+
+    if bill_discount > 0:
+        text += f"\n🏷️ Bill discount: -{symbol}{bill_discount:,.0f}"
 
     # Validate fees_mode
     valid_modes = ("both_inclusive", "sc_exclusive_vat_inclusive", "both_exclusive")
@@ -1663,9 +1789,11 @@ def main():
     app.add_handler(CommandHandler("assign", cmd_assign))
     app.add_handler(CommandHandler("unassign", cmd_unassign))
     app.add_handler(CommandHandler("done", cmd_done))
+    app.add_handler(CommandHandler("reopen", cmd_reopen))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("setfees", cmd_setfees))
+    app.add_handler(CommandHandler("setdiscount", cmd_setdiscount))
     app.add_handler(CommandHandler("resetpicks", cmd_resetpicks))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
